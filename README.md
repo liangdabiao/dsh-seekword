@@ -74,6 +74,7 @@ npm run dev     # 面板独立预览 http://127.0.0.1:5197/seekword/（DSH_HOME 
 
 ## 致谢
 
+- 社区支持： https://linux.do
 - 原项目：[SeekWord 捕获生词](https://github.com/liangdabiao/SeekWord)（继承自 [CaptiPrep](https://github.com/jeanchristophe13v/CaptiPrep)）
 - YouTube 字幕方案参考：[youtube-caption-extractor](https://github.com/devhims/youtube-caption-extractor)、[read-frog](https://github.com/mengxi-ream/read-frog)
 
