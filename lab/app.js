@@ -1,4 +1,6 @@
 // 捕获生词 · 面板逻辑：导入区（4 渠道+执行按钮）/ 学习（材料状态机：①分析→②制卡→③闪卡）/ 单词本 / 设置。
+// 四个渠道都只做交接：选文件/贴文本/填链接 → 点「分析」= 开新对话把材料线索交给 agent，
+// 文件读取、网页抓取、格式转换、入库、筛词全由 agent 完成（面板不落库、不解析、不抓取）。
 // 「分析生词」「生成卡片」走 agent：嵌入 dsh → postMessage（client.js startSession 填草稿不自动发送）；
 // 独立浏览器预览 → 复制提示词。点按钮后面板每 2 秒轻量轮询，agent 入库自动刷新视图。
 (() => {
@@ -9,9 +11,9 @@
   const state = {
     catalog: null,
     view: 'home',
-    learn: null,        // { id, meta, sourceText, candidates, cards, favorites, idx, flipped, grid }
+    learn: null,        // { id, meta, sourceText, candidates, cards, favorites, idx, grid }
     wb: { q: '', fav: false, source: '', cards: [], total: 0 },
-    capture: { tab: 'file', file: null },
+    capture: { tab: 'file', path: '', text: '', url: '' },
     waiting: null,      // { contentId, title, baseline:{cand,cards}, since }
   }
   let pollTimer = null
@@ -101,11 +103,62 @@
       `请按 seekword 技能的制卡规则，为每个词生成卡片（发音/词性/贴合原文语境的释义/两组双语例句/语法备注），` +
       `然后调 seekword(action="save_cards", contentId="${m.content_id}", cards=[...], selected=[...]) 入库，最后按技能输出规则给出卡片清单。`
   }
+  // 文件渠道的交接指令：面板只给路径，读文件/转格式/入库/筛词全交给 agent（不重复劳动）。
+  function importFilePrompt(path, maxCards) {
+    return `用本地文件做生词预习，文件路径：${path}\n` +
+      `材料标题默认用文件名。\n` +
+      `请按 seekword 技能执行：\n` +
+      `1. 入库：先 seekword(action="capture", source="file", path="${path}")（txt / md / srt / vtt / json3 直接可读）。` +
+      `工具读不了这个格式（pdf / docx / epub / html 等）时，你自己先把文件转成正文文本，再 seekword(action="capture", source="text", textContent="...") 入库；` +
+      `确实读不出来就直说原因，不要凭文件名猜内容。\n` +
+      `2. 用 seekword(action="read", contentId=..., offset/limit 分段) 通读全文，按 seekword 技能的筛选规则` +
+      `挑最多 ${maxCards || 30} 个高价值生词（term 必须是原文表面形式，宁缺毋滥），save_candidates 入库。\n` +
+      `3. 把候选词清单给我；等用户选定词之后再按技能制卡。`
+  }
+  // 文本渠道：原文整段写进草稿，agent 原样入库（面板不落库、不解析）
+  function importTextPrompt(text, maxCards) {
+    return `用下面这段原文做生词预习（用户从面板粘贴的）。\n` +
+      `请按 seekword 技能执行：\n` +
+      `1. 入库：把【原文】整段原样传给 seekword(action="capture", source="text", textContent="...")，` +
+      `不要改写、不要摘要、不要只取片段。\n` +
+      `2. 用 seekword(action="read", contentId=..., offset/limit 分段) 通读全文，按 seekword 技能的筛选规则` +
+      `挑最多 ${maxCards || 30} 个高价值生词（term 必须是原文表面形式，宁缺毋滥），save_candidates 入库。\n` +
+      `3. 把候选词清单给我；等用户选定词之后再按技能制卡。\n\n` +
+      `【原文】\n${text}`
+  }
+  // YouTube / 网页渠道：只给链接，抓取（含失败兜底）由 agent 负责
+  function importUrlPrompt(kind, url, maxCards) {
+    const yt = kind === 'youtube'
+    return (yt ? `用这个 YouTube 视频的字幕做生词预习：${url}\n` : `用这个网页的正文做生词预习：${url}\n`) +
+      `请按 seekword 技能执行：\n` +
+      `1. 入库：seekword(action="capture", source="${kind}", url="${url}")` +
+      (yt ? '（工具自动多客户端降级抓字幕，失败会把诊断信息给你）' : '（工具做基础正文提取）') + `。\n` +
+      `2. 抓取失败或正文太短就如实告诉我原因，别编造正文` +
+      (yt ? '；需要的话你自己用字幕/网页工具兜底再入库。' : '；需要的话你自己用抓取工具读全文再入库。') + `\n` +
+      `3. 入库后用 seekword(action="read", ...) 分段通读，按技能筛选规则挑最多 ${maxCards || 30} 个高价值生词（term 必须是原文表面形式），save_candidates 入库。\n` +
+      `4. 把候选词清单给我；等用户选定词之后再按技能制卡。`
+  }
+  // 插件独立工作区（每次交接都落到它里面，不占用用户其它工作区）
+  let workspacePromise = null
+  function ensureWorkspace() {
+    if (!workspacePromise) {
+      workspacePromise = api('/api/workspace')
+        .then((r) => ({ path: r.path || '', workspaceId: r.workspaceId || '' }))
+        .catch(() => ({ path: '', workspaceId: '' }))
+    }
+    return workspacePromise
+  }
+
   async function handToAgent(prompt, waitingId, waitingTitle) {
     if (EMBEDDED) {
       try {
-        window.parent.postMessage({ type: 'seekword:refresh', prompt }, location.origin)
-        toast('已交给对话：草稿已填入，点「发送」后 agent 开始（面板每 2 秒自动检查入库）')
+        const ws = await ensureWorkspace()
+        const payload = { type: 'seekword:refresh', prompt }
+        if (ws.workspaceId) payload.workspaceId = ws.workspaceId
+        window.parent.postMessage(payload, location.origin)
+        toast(waitingId
+          ? '已交给对话：草稿已填入，点「发送」后 agent 开始（面板每 2 秒自动检查入库）'
+          : '已在对话里填好，点「发送」开始')
       } catch {
         try { await navigator.clipboard.writeText(prompt); toast('交给对话失败：提示词已复制，请粘贴发送') } catch { toast('交给对话失败') }
       }
@@ -133,12 +186,35 @@
     pollTimer = null
     state.waiting = null
   }
+  // 交接（分析）后没有 contentId：盯「有没有新材料出现」，出现即刷新
+  function startWatchingNew() {
+    stopWaiting()
+    const base = new Set(((state.catalog && state.catalog.contents) || []).map((m) => m.content_id))
+    state.waiting = { watch: true, baseline: base, title: '新材料', since: Date.now() }
+    pollTimer = setInterval(pollOnce, 2000)
+    paintWaitingBar()
+  }
   async function pollOnce() {
     if (!state.waiting) return
     try {
       const c = await api('/api/catalog')
       state.catalog = c
       paintCounts()
+      if (state.waiting.watch) {
+        const fresh = (c.contents || []).find((m) => !state.waiting.baseline.has(m.content_id))
+        if (fresh) {
+          const refreshView = state.view
+          stopWaiting()
+          toast(`agent 已导入《${fresh.title}》：可以进学习页看候选词`)
+          if (refreshView === 'home') await renderHome()
+          paintWaitingBar()
+        } else if (Date.now() - state.waiting.since > 600000) {
+          stopWaiting()
+          toast('等待超时（10 分钟）：agent 入库后材料会自动出现在列表里')
+          paintWaitingBar()
+        }
+        return
+      }
       const mm = c.contents.find((x) => x.content_id === state.waiting?.contentId)
       if (!mm) return
       const grown = (mm.candidate_count || 0) > state.waiting.baseline.cand
@@ -160,10 +236,13 @@
   function paintWaitingBar() {
     const slot = document.getElementById('waiting-slot')
     if (!slot) return
-    slot.innerHTML = state.waiting ? `
+    const w = state.waiting
+    slot.innerHTML = w ? `
       <div class="waiting-bar" id="waiting-bar">
         <span class="spin">⏳</span>
-        <span>等待 agent 入库：<b>${esc(state.waiting.title)}</b>（每 2 秒自动检查）</span>
+        <span>${w.watch
+          ? '等待 agent 入库新材料（每 2 秒自动检查）'
+          : `等待 agent 入库：<b>${esc(w.title)}</b>（每 2 秒自动检查）`}</span>
         <button class="ghost" id="waiting-cancel">取消等待</button>
       </div>` : ''
     document.getElementById('waiting-cancel')?.addEventListener('click', () => {
@@ -173,12 +252,30 @@
     })
   }
 
-  // ── TTS（浏览器语音，本地合成） ────────────────────────────────────────
-  function speak(text, lang) {
+  // ── 朗读：优先宿主 edge-tts（微软在线语音，音质好、无需 key） ──────────
+  // /api/tts 给出 mp3（宿主本地缓存）；不可用（没装 python edge_tts / 无网）才回退浏览器语音。
+  let audioEl = null
+  function playTts(text, lang) {
+    const t = String(text || '').trim()
+    if (!t) return
+    const accent = state.catalog?.settings?.accent || 'us'
+    const url = `/seekword/api/tts?text=${encodeURIComponent(t)}&lang=${encodeURIComponent(lang || 'en')}&accent=${encodeURIComponent(accent)}`
     try {
-      if (!('speechSynthesis' in window)) return toast('当前环境不支持语音合成')
+      if (audioEl) { try { audioEl.pause() } catch { /* ignore */ } }
+      audioEl = new Audio(url)
+      audioEl.onerror = () => speakFallback(t, lang)
+      const p = audioEl.play()
+      if (p && typeof p.catch === 'function') p.catch(() => speakFallback(t, lang))
+    } catch {
+      speakFallback(t, lang)
+    }
+  }
+  // 兜底：浏览器内置语音（音质差，只在 edge-tts 不可用时用）
+  function speakFallback(text, lang) {
+    try {
+      if (!('speechSynthesis' in window)) return
       speechSynthesis.cancel()
-      const u = new SpeechSynthesisUtterance(String(text || '').slice(0, 120))
+      const u = new SpeechSynthesisUtterance(String(text || '').slice(0, 200))
       const tag = TTS_LANG[lang] || ''
       if (tag) u.lang = tag
       const voices = speechSynthesis.getVoices()
@@ -196,11 +293,12 @@
     const query = new URLSearchParams(queryPart || '')
     const view = (pathPart === '/' || pathPart === '') ? 'home' : pathPart.slice(1)
     state.view = view
-    if (view === 'wordbook' || view === 'settings') stopWaiting()
+    if (view === 'wordbook' || view === 'settings' || view === 'learned') stopWaiting()
     for (const a of document.querySelectorAll('.nav a')) a.classList.toggle('active', a.dataset.view === view)
     try {
       if (view === 'learn') await renderLearn(query.get('id'))
       else if (view === 'wordbook') await renderWordbook()
+      else if (view === 'learned') await renderLearned()
       else if (view === 'settings') renderSettings()
       else await renderHome()
       paintWaitingBar()
@@ -218,7 +316,7 @@
   function paintCounts() {
     const c = state.catalog
     if (!c) return
-    const map = { contents: c.stats.contents, cards: c.stats.cards, favorites: c.stats.favorites }
+    const map = { contents: c.stats.contents, cards: c.stats.cards, favorites: c.stats.favorites, learned: c.stats.learned || 0 }
     for (const el of document.querySelectorAll('[data-count]')) el.textContent = map[el.dataset.count] ?? ''
   }
 
@@ -237,7 +335,7 @@
     ]
     $app.innerHTML = `
       <h1>捕获生词</h1>
-      <p class="sub">导入 → 点「① 分析生词」交给 agent 筛选制卡 → 面板翻卡复习。数据目录 <span class="mono">${esc(cat.dataDir)}</span></p>
+      <p class="sub">使用方法： 导入英文资料 -> 分析捕获生词</p>
       <div id="waiting-slot"></div>
       <div class="grid2">
         <div class="card stat"><div class="num">${s.contents}</div><div class="lbl">捕获材料</div></div>
@@ -252,30 +350,30 @@
           ${TABS.map(([t, n]) => `<button data-tab="${t}" class="${tab === t ? 'on' : ''}">${n}</button>`).join('')}
         </div>
         <div class="field ${tab === 'file' ? '' : 'hide'}" data-field="file">
-          <input type="file" id="cap-file-input" accept=".txt,.md,.srt,.vtt,.json3,.json,text/plain" style="display:none">
           <div class="row">
-            <button id="cap-pick">选择文件…</button>
-            <span class="muted" style="font-size:12px">支持 txt / md / srt / vtt / json3 字幕与文本</span>
+            <input id="cap-path" style="flex:1;min-width:240px" placeholder="文件路径，如 D:\资料\article.pdf" value="${esc(state.capture.path || '')}">
+            <button id="cap-pick" title="打开系统的「打开文件」对话框">选择文件…</button>
+            <button class="primary cap-go">分析</button>
           </div>
+          <div class="muted" style="font-size:12px;margin-top:6px;display:none" id="cap-pick-hint"></div>
           <div id="cap-file-chip" style="margin-top:8px"></div>
         </div>
         <div class="field ${tab === 'text' ? '' : 'hide'}" data-field="text">
-          <label>原文（粘贴任意语言文本）</label>
-          <textarea id="cap-text" placeholder="粘贴要学的文章/字幕/段落……"></textarea>
+          <textarea id="cap-text" placeholder="粘贴原文……">${esc(state.capture.text || '')}</textarea>
+          <div class="row end" style="margin-top:8px"><button class="primary cap-go">分析</button></div>
         </div>
         <div class="field ${tab === 'youtube' ? '' : 'hide'}" data-field="youtube">
-          <label>YouTube 视频链接或 videoId（自动抓字幕，多客户端降级；国内网络可在设置页配代理）</label>
-          <input id="cap-url" style="width:100%" placeholder="https://www.youtube.com/watch?v=...">
+          <div class="row">
+            <input id="cap-url-yt" style="flex:1;min-width:240px" placeholder="https://www.youtube.com/watch?v=..." value="${esc(state.capture.url || '')}">
+            <button class="primary cap-go">分析</button>
+          </div>
         </div>
         <div class="field ${tab === 'web' ? '' : 'hide'}" data-field="web">
-          <label>网页链接（http/https，自动提取正文）</label>
-          <input id="cap-url" style="width:100%" placeholder="https://example.com/article">
+          <div class="row">
+            <input id="cap-url-web" style="flex:1;min-width:240px" placeholder="https://example.com/article" value="${esc(state.capture.url || '')}">
+            <button class="primary cap-go">分析</button>
+          </div>
         </div>
-        <div class="row" style="margin-top:10px">
-          <input id="cap-title" placeholder="标题（可留空自动取）" style="flex:1;min-width:180px">
-          <button class="primary" id="cap-go">导入</button>
-        </div>
-        <div class="muted" style="font-size:12px;margin-top:6px">导入后自动跳到「学习」页，点「① 分析生词」交给 agent 筛选制卡。</div>
       </div>
 
       <h2>材料列表<span class="muted" style="font-weight:400;font-size:12px">（新→旧 · 状态列即下一步按钮）</span></h2>
@@ -299,7 +397,7 @@
             </tr>`
             }).join('')}
           </tbody>
-        </table>` : '<div class="empty">还没有材料。选择一个文件、或粘贴一段文本，点「导入」。</div>'}
+        </table>` : '<div class="empty">还没有材料。</div>'}
       </div>`
 
     // tabs
@@ -310,105 +408,117 @@
       renderHome()
     })
 
-    // 文件选择（Electron 里 File.path 可取本地路径；取不到则前端读内容降级 text 通道）
-    $app.querySelector('#cap-pick').addEventListener('click', () => $app.querySelector('#cap-file-input').click())
-    $app.querySelector('#cap-file-input').addEventListener('change', (e) => {
-      const f = e.target.files && e.target.files[0]
-      if (!f) return
-      let realPath = ''
-      try { realPath = f.path || '' } catch { realPath = '' }
-      if (!realPath && window.webUtils?.getPathForFile) {
-        try { realPath = window.webUtils.getPathForFile(f) || '' } catch { realPath = '' }
-      }
-      state.capture.file = { name: f.name, size: f.size, path: realPath, blob: f }
+    // 选择文件：宿主弹系统原生「打开文件」框，只回绝对路径（面板不读文件内容）
+    const pickBtn = $app.querySelector('#cap-pick')
+    const pathInput = $app.querySelector('#cap-path')
+    const caps = cat.capabilities || {}
+    if (caps.pickFile === false) {
+      pickBtn.disabled = true
+      pickBtn.style.opacity = 0.45
+      const hint = $app.querySelector('#cap-pick-hint')
+      if (hint) hint.textContent = '当前宿主不支持弹窗选文件（仅 Windows 桌面支持），请直接粘贴文件路径。'
+    } else {
+      pickBtn.addEventListener('click', async () => {
+        const label = pickBtn.textContent
+        pickBtn.disabled = true
+        pickBtn.textContent = '选择中…'
+        try {
+          const r = await apiPost('/api/pick', { title: '选择要学的文件' })
+          if (r.ok && r.path) {
+            state.capture.path = r.path
+            if (pathInput) pathInput.value = r.path
+            paintFileChip()
+            toast(r.exists === false ? '选到了路径，但文件好像不在原处了' : `已选择：${String(r.path).split(/[\\/]/).pop()}`)
+          } else if (r.cancelled) {
+            toast('已取消选择')
+          } else {
+            toast(r.error || '没有选到文件，也可以手填路径')
+          }
+        } catch (err) {
+          const msg = String(err && err.message || err)
+          toast(/404|not found/i.test(msg)
+            ? '宿主还是旧版（没有选文件路由）：重启 dsh 后可用，现在请直接粘贴文件路径'
+            : `打开文件框失败：${msg}`)
+        } finally {
+          pickBtn.disabled = false
+          pickBtn.textContent = label
+        }
+      })
+    }
+    pathInput?.addEventListener('input', () => {
+      state.capture.path = pathInput.value
       paintFileChip()
     })
+    const textEl = $app.querySelector('#cap-text')
+    textEl?.addEventListener('input', () => { state.capture.text = textEl.value })
+    for (const el of $app.querySelectorAll('#cap-url-yt, #cap-url-web')) {
+      el.addEventListener('input', () => { state.capture.url = el.value })
+    }
     paintFileChip()
 
-    // 导入（执行按钮）
-    $app.querySelector('#cap-go').addEventListener('click', doImport)
+    // 分析（执行按钮）
+    for (const b of $app.querySelectorAll('.cap-go')) b.addEventListener('click', doImport)
 
-    // 材料行：执行按钮 / 删除 / 打开原文链接
-    $app.addEventListener('click', (e) => {
-      const opener = e.target.closest('[data-open]')
-      if (opener) { openLink(opener.dataset.open); return }
-      const act = e.target.closest('button[data-act]')
-      if (act) {
-        const m = contents.find((x) => x.content_id === act.dataset.id)
-        if (!m) return
-        if (act.dataset.act === 'analyze') {
-          handToAgent(analyzePrompt(m, cat.settings?.max_cards), m.content_id, m.title)
-        } else {
-          location.hash = `#/learn?id=${encodeURIComponent(m.content_id)}`
-        }
-        return
-      }
-      const b = e.target.closest('button[data-del]')
-      if (!b) return
-      if (!confirm('删除该材料及其卡片？（收藏快照保留）')) return
-      apiDelete(`/api/contents/${encodeURIComponent(b.dataset.del)}`)
-        .then(() => { toast('已删除'); renderHome() })
-        .catch((err) => toast(`删除失败：${err.message}`))
-    }, { once: true })
+    // 材料行：执行按钮 / 删除 / 打开原文链接（委托监听在启动时只挂一次，见文件末尾）
   }
 
+  // 只显示「将交给 agent 的路径」，不做任何文件读取/解析
   function paintFileChip() {
     const chip = $app.querySelector('#cap-file-chip')
     if (!chip) return
-    const f = state.capture.file
-    if (!f) { chip.innerHTML = ''; return }
-    const kb = f.size > 1024 * 1024 ? `${(f.size / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(f.size / 1024))} KB`
-    const hasPath = f.path && /^([a-zA-Z]:[\\/]|\/)/.test(f.path)
+    const path = String(state.capture.path || '').trim()
+    if (!path) { chip.innerHTML = ''; return }
+    const name = path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || path
+    const isAbs = /^([a-zA-Z]:[\\/]|\\\\|\/)/.test(path)
     chip.innerHTML = `
-      <span class="filechip">📄 <b>${esc(f.name)}</b>（${kb}）· ${hasPath ? '路径已获取，直接导入' : '浏览器拿不到本地路径，将读取内容导入'}
+      <span class="filechip">📄 <b>${esc(name)}</b> · ${isAbs ? '交给 agent 解析' : '看起来不是绝对路径，请确认'}
         <span class="x" id="cap-file-clear" title="清除">✕</span></span>`
     chip.querySelector('#cap-file-clear')?.addEventListener('click', () => {
-      state.capture.file = null
-      const input = $app.querySelector('#cap-file-input')
+      state.capture.path = ''
+      const input = $app.querySelector('#cap-path')
       if (input) input.value = ''
       paintFileChip()
     })
   }
 
+  // 每个渠道的输入控件各自唯一（别再出现两个 tab 共用同一个 id：querySelector 会取到另一个 tab 的空框）
+  const FIELD_INPUT = { file: '#cap-path', text: '#cap-text', youtube: '#cap-url-yt', web: '#cap-url-web' }
+  function fieldValue(tab) {
+    const el = $app.querySelector(FIELD_INPUT[tab])
+    return String(el?.value || '').trim()
+  }
+
+  // 四个渠道同一套动作：面板只把「材料线索」写进草稿交给 agent，入库/解析/筛词全由 agent 做
   async function doImport() {
     const tab = state.capture.tab
-    const titleEl = $app.querySelector('#cap-title')
-    const title = titleEl?.value.trim() || ''
-    const payload = { title }
+    const maxCards = state.catalog?.settings?.max_cards
+    let prompt = ''
     if (tab === 'file') {
-      const f = state.capture.file
-      if (!f) return toast('先选择文件')
-      if (f.path && /^([a-zA-Z]:[\\/]|\/)/.test(f.path)) {
-        payload.source = 'file'
-        payload.path = f.path
-      } else {
-        try {
-          payload.source = 'text'
-          payload.text = await f.blob.text()
-        } catch (e) { return toast(`读取文件内容失败：${e.message}`) }
-      }
+      const path = String(state.capture.path || fieldValue('file')).trim()
+      if (!path) return toast('先选择文件或填文件路径')
+      if (!/^([a-zA-Z]:[\\/]|\\\\|\/)/.test(path)) return toast('请给绝对路径（如 D:\\资料\\article.pdf）')
+      prompt = importFilePrompt(path, maxCards)
     } else if (tab === 'text') {
-      payload.source = 'text'
-      payload.text = $app.querySelector('#cap-text').value.trim()
-      if (!payload.text) return toast('先粘贴原文')
+      const text = fieldValue('text')
+      if (!text) return toast('先粘贴原文')
+      prompt = importTextPrompt(text, maxCards)
     } else {
-      payload.source = tab
-      payload.url = $app.querySelector('#cap-url').value.trim()
-      if (!payload.url) return toast('先填链接')
+      const url = fieldValue(tab)
+      if (!url) return toast('先填链接')
+      if (tab === 'web' && !/^https?:\/\//i.test(url)) return toast('网页链接要以 http(s):// 开头')
+      prompt = importUrlPrompt(tab, url, maxCards)
     }
-    const btn = $app.querySelector('#cap-go')
-    btn.disabled = true
-    btn.textContent = '导入中…'
-    try {
-      const r = await apiPost('/api/capture', payload)
-      toast(`已导入《${r.meta.title}》：到学习页点「① 分析生词」`)
-      await loadCatalog(true)
-      location.hash = `#/learn?id=${encodeURIComponent(r.meta.content_id)}`
-    } catch (e) {
-      toast(`导入失败：${e.message}`)
-      btn.disabled = false
-      btn.textContent = '导入'
+    await handToAgent(prompt)
+    // 草稿已交给 agent：清掉面板里的输入，避免重复提交
+    state.capture.text = ''
+    state.capture.url = ''
+    state.capture.path = ''
+    for (const sel of ['#cap-text', '#cap-url-yt', '#cap-url-web', '#cap-path']) {
+      const el = $app.querySelector(sel)
+      if (el) el.value = ''
     }
+    paintFileChip()
+    startWatchingNew()
   }
 
   function latestLabel(m) {
@@ -420,7 +530,7 @@
     const cat = await loadCatalog()
     const contents = cat.contents || []
     if (!contents.length) {
-      $app.innerHTML = `<h1>学习</h1><div id="waiting-slot"></div><div class="empty">还没有材料。先到「概览」导入一段内容。</div>`
+      $app.innerHTML = `<h1>学习</h1><div id="waiting-slot"></div><div class="empty">还没有材料。先到「概览」把材料交给 agent，agent 入库后这里就有候选词了。</div>`
       return
     }
     const target = id ? contents.find((m) => m.content_id === id) : contents[0]
@@ -437,7 +547,6 @@
       cards: detail.cards || [],
       favorites: new Set(detail.favorites || []),
       idx: 0,
-      flipped: false,
       grid: false,
     }
     paintLearn()
@@ -523,7 +632,7 @@
     }
 
     if (step === 'cards') {
-      $app.querySelector('#learn-grid')?.addEventListener('click', () => { L.grid = !L.grid; L.flipped = false; paintLearn() })
+      $app.querySelector('#learn-grid')?.addEventListener('click', () => { L.grid = !L.grid; paintLearn() })
       $app.querySelector('#learn-export')?.addEventListener('click', () => downloadCsv(`content_id=${encodeURIComponent(L.id)}`, L.meta.title))
       paintFlash()
       bindFlashKeys()
@@ -544,35 +653,41 @@
       area.querySelectorAll('[data-goto]').forEach((el) => el.addEventListener('click', () => {
         L.idx = Number(el.dataset.goto)
         L.grid = false
-        L.flipped = false
         paintLearn()
       }))
       return
     }
     const c = L.cards[L.idx]
     if (!c) { area.innerHTML = '<div class="empty">没有卡片</div>'; return }
-    const pron = c.ipa || c.reading || ''
+    const pron = c.ipa || c.ipa_us || c.ipa_uk || c.reading || ''
     const fav = L.favorites.has(c.term)
+    // 只读英语：生词与英文例句给 🔊，译文不读（这是学英语的插件）
+    const speaker = (text, lang, title) => (text
+      ? `<button class="ghost tts-inline" data-tts="${esc(text)}" data-lang="${esc(lang || '')}" title="${esc(title)}">🔊</button>`
+      : '')
+    const exHtml = (c.examples || []).map((ex) => {
+      const lines = String(ex).split('\n')
+      const en = lines[0] || ''
+      const tr = lines[1] || ''
+      return `<div class="ex">
+        <em>${esc(en)}${speaker(en, L.meta.lang, '朗读例句')}</em>
+        ${tr ? `<span>${esc(tr)}</span>` : ''}
+      </div>`
+    }).join('')
     area.innerHTML = `
       <div class="flash-wrap">
         <div class="flash" id="flash">
-          <span class="sense">${L.flipped ? '释义' : '生词'}</span>
-          <button class="fav ${fav ? 'on' : ''}" id="fav-btn" title="收藏（空格）">${fav ? '♥' : '♡'}</button>
-          <button class="ghost tts" id="tts-btn" title="朗读">🔊</button>
-          ${L.flipped ? `
-            <div class="definition">${esc(c.definition)}</div>
-            <div class="pron">${esc(c.term)}${pron ? ` · ${esc(pron)}` : ''}${c.pos ? ` · ${esc(c.pos)}` : ''}</div>
-            ${(c.examples || []).length ? `<div class="examples">${c.examples.map((ex) => {
-              const lines = String(ex).split('\n')
-              return `<div class="ex"><em>${esc(lines[0] || '')}</em><span>${esc(lines[1] || '')}</span></div>`
-            }).join('')}</div>` : ''}
-            ${c.notes ? `<div class="notes">${esc(c.notes)}</div>` : ''}
-          ` : `
-            <div class="term">${esc(c.term)}</div>
-            ${pron ? `<div class="pron">${esc(pron)}</div>` : ''}
-            ${c.pos ? `<span class="badge pos">${esc(c.pos)}</span>` : ''}
-            <div class="hint">点击翻转看释义</div>
-          `}
+          <div class="flash-top">
+            <span class="term">${esc(c.term)}</span>
+            ${speaker(c.term, L.meta.lang, '朗读生词')}
+            <span class="spacer"></span>
+            <button class="learned-btn" id="learned-btn" title="学会了：收进「学会了」栏目，不再出现在学习/单词本">✓ 学会了</button>
+            <button class="fav ${fav ? 'on' : ''}" id="fav-btn" title="收藏（空格）">${fav ? '♥' : '♡'}</button>
+          </div>
+          ${(pron || c.pos) ? `<div class="meta">${pron ? `<span class="pron">${esc(pron)}</span>` : ''}${c.pos ? `<span class="badge pos">${esc(c.pos)}</span>` : ''}</div>` : ''}
+          <div class="definition">${esc(c.definition)}</div>
+          ${exHtml ? `<div class="examples">${exHtml}</div>` : ''}
+          ${c.notes ? `<div class="notes">${esc(c.notes)}</div>` : ''}
         </div>
         <div class="learn-bar">
           <button id="prev-btn" ${L.idx === 0 ? 'disabled' : ''}>←</button>
@@ -582,15 +697,41 @@
         <div class="progress"><i style="width:${((L.idx + 1) / L.cards.length) * 100}%"></i></div>
       </div>`
 
+    // 所有 🔊 走同一套委托：生词、例句、译文各自 take 自己的文本与语言
     area.querySelector('#flash').addEventListener('click', (e) => {
-      if (e.target.closest('button')) return
-      L.flipped = !L.flipped
-      paintFlash()
+      const btn = e.target.closest('[data-tts]')
+      if (!btn) return
+      playTts(btn.dataset.tts, btn.dataset.lang || L.meta.lang)
     })
     area.querySelector('#prev-btn').addEventListener('click', () => stepFlash(-1))
     area.querySelector('#next-btn').addEventListener('click', () => stepFlash(1))
     area.querySelector('#fav-btn').addEventListener('click', () => toggleFav(c.term))
-    area.querySelector('#tts-btn').addEventListener('click', () => speak(c.term, L.meta.lang))
+    area.querySelector('#learned-btn').addEventListener('click', () => markLearnedNow(c.term))
+  }
+
+  // 学会了：卡片离开学习/单词本，归档到「学会了」栏目
+  async function markLearnedNow(term) {
+    const L = state.learn
+    try {
+      await apiPost('/api/learned', { content_id: L.id, term })
+      const i = L.cards.findIndex((c) => c.term === term)
+      if (i >= 0) L.cards.splice(i, 1)
+      L.favorites.delete(term)
+      if (L.idx >= L.cards.length) L.idx = Math.max(0, L.cards.length - 1)
+      await loadCatalog(true)
+      await renderLearn(L.id)
+      toast(`「${term}」已收进学会了`)
+    } catch (e) { toast(`标记失败：${e.message}`) }
+  }
+
+  // 撤销学会了（「学会了」栏目）
+  async function restoreLearned(term) {
+    try {
+      await apiPost('/api/learned/remove', { term })
+      await loadCatalog(true)
+      renderLearned()
+      toast(`「${term}」已放回单词本`)
+    } catch (e) { toast(`撤销失败：${e.message}`) }
   }
 
   function stepFlash(d) {
@@ -598,7 +739,6 @@
     const next = L.idx + d
     if (next < 0 || next >= L.cards.length) return
     L.idx = next
-    L.flipped = false
     paintFlash()
   }
 
@@ -630,6 +770,36 @@
         if (c) toggleFav(c.term)
       }
     }, { capture: true })
+  }
+
+  // ── 学会了（归档栏目：这些词已离开学习/单词本） ────────────────────────
+  async function renderLearned() {
+    await loadCatalog()
+    const data = await api('/api/learned')
+    const rows = data.learned || []
+    $app.innerHTML = `
+      <h1>学会了</h1>
+      <p class="sub">已归档 ${rows.length} 个词。这些词不再出现在学习与单词本里；点「撤销」可以放回去。</p>
+      <div class="card" style="padding:6px 10px">
+        ${rows.length ? `<table>
+          <thead><tr><th>生词</th><th>读音/音标</th><th>词性</th><th>释义</th><th>来源材料</th><th>学会时间</th><th></th></tr></thead>
+          <tbody>${rows.map((r) => {
+            const c = r.snapshot || {}
+            return `<tr>
+              <td style="font-weight:700">${esc(r.term)}</td>
+              <td class="mono">${esc(c.ipa || c.ipa_us || c.ipa_uk || c.reading || '')}</td>
+              <td class="muted">${esc(c.pos || '')}</td>
+              <td>${esc(c.definition || '')}</td>
+              <td class="muted">${esc(String(r.title || '').slice(0, 18))}</td>
+              <td class="muted mono">${esc(String(r.learned_at || '').slice(0, 10))}</td>
+              <td><button class="ghost" data-restore="${esc(r.term)}">撤销</button></td>
+            </tr>`
+          }).join('')}</tbody>
+        </table>` : '<div class="empty">还没有学会的词。学习时点「✓ 学会了」，词就会归档到这里。</div>'}
+      </div>`
+    for (const b of $app.querySelectorAll('[data-restore]')) {
+      b.addEventListener('click', () => restoreLearned(b.dataset.restore))
+    }
   }
 
   // ── 单词本 ─────────────────────────────────────────────────────────────
@@ -683,7 +853,7 @@
     bindWbFav()
   }
 
-  function bindWbFav() {
+  function bindWbFav(reload) {
     $app.querySelectorAll('[data-wbfav]').forEach((btn) => btn.addEventListener('click', async () => {
       const term = btn.dataset.wbfav
       const cid = btn.dataset.cid
@@ -695,19 +865,34 @@
         toast(r.favorited ? `已收藏「${term}」` : `已取消收藏「${term}」`)
       } catch (e) { toast(`收藏失败：${e.message}`) }
     }))
+    // 学会了：归档到「学会了」栏目（从单词本列表消失）
+    $app.querySelectorAll('[data-wblearn]').forEach((btn) => btn.addEventListener('click', async () => {
+      const term = btn.dataset.wblearn
+      try {
+        await apiPost('/api/learned', { content_id: btn.dataset.cid, term })
+        await loadCatalog(true)
+        toast(`「${term}」已收进学会了`)
+        if (reload) await reload(); else await renderWordbook()
+      } catch (e) { toast(`标记失败：${e.message}`) }
+    }))
+    // 单词本每行的朗读（与闪卡同一套 edge-tts）
+    $app.querySelectorAll('[data-tts]').forEach((btn) => {
+      btn.addEventListener('click', () => playTts(btn.dataset.tts, btn.dataset.lang || 'en'))
+    })
   }
 
   function wbTable(cards) {
-    if (!cards.length) return '<div class="empty">没有匹配的卡片。先导入材料、生成卡片。</div>'
+    if (!cards.length) return '<div class="empty">没有匹配的卡片。先让 agent 导入材料并制卡。</div>'
     return `<table>
-      <thead><tr><th></th><th>生词</th><th>读音/音标</th><th>词性</th><th>释义</th><th>材料</th></tr></thead>
+      <thead><tr><th></th><th>生词</th><th>读音/音标</th><th>词性</th><th>释义</th><th></th><th></th></tr></thead>
       <tbody>${cards.map((c) => `<tr>
         <td><button class="ghost ${c.favorite ? 'on' : ''}" data-wbfav="${esc(c.term)}" data-cid="${esc(c.content_id)}" style="${c.favorite ? 'color:var(--bad)' : ''}">${c.favorite ? '♥' : '♡'}</button></td>
         <td style="font-weight:700">${esc(c.term)}</td>
-        <td class="mono">${esc(c.ipa || c.reading || '')}</td>
+        <td class="mono">${esc(c.ipa || c.ipa_us || c.ipa_uk || c.reading || '')}</td>
         <td class="muted">${esc(c.pos || '')}</td>
         <td>${esc(c.definition || '')}${c.orphan ? ' <span class="badge">源已删</span>' : ''}</td>
-        <td class="muted">${esc(String(c.title || '').slice(0, 18))}</td>
+        <td><button class="ghost tts-inline" data-tts="${esc(c.term)}" data-lang="${esc(c.lang || 'en')}" title="朗读生词">🔊</button></td>
+        <td><button class="ghost" data-wblearn="${esc(c.term)}" data-cid="${esc(c.content_id)}" title="学会了：归档到「学会了」">✓ 学会了</button></td>
       </tr>`).join('')}</tbody>
     </table>`
   }
@@ -759,12 +944,16 @@
           <label>HTTP(S) 代理（抓 YouTube/网页用，如 http://127.0.0.1:7890，留空直连）</label>
           <input id="set-proxy" value="${esc(s.proxy_url || '')}" style="width:100%" placeholder="http://127.0.0.1:7890">
         </div>
+        <div class="field">
+          <label>分析工作区（点「分析」开的对话都在这里，不占用你的其它工作区）</label>
+          <div class="mono" id="set-workspace" style="font-size:13.5px">读取中…</div>
+        </div>
         <div class="row end"><span class="muted" id="set-saved" style="font-size:12px"></span></div>
       </div>
       <h2>学习方式</h2>
       <div class="card muted" style="max-width:560px;font-size:13px">
-        <p style="margin:4px 0"><b>导入 → 分析 → 学习</b>：概览页四渠道导入（文件/粘贴/YouTube/网页）→ 材料列表或学习页点「① 分析生词」交给 agent → 候选回面板勾选 → 「② 生成卡片」→ 闪卡学习。点按钮后面板每 2 秒自动检查入库并刷新。</p>
-        <p style="margin:4px 0">闪卡键盘：<b>←/→</b> 切换 · <b>空格</b> 收藏 · 点击翻转释义。🔊 用浏览器本地语音朗读（无需 API key）。</p>
+        <p style="margin:4px 0"><b>概览页</b>：选文件 / 贴原文 / 填链接 → 点「分析」= 开新对话交给 agent，入库与筛词由 agent 完成，面板 2 秒轮询自动刷新。候选勾选后「② 生成卡片」交给 agent 制卡。</p>
+        <p style="margin:4px 0">闪卡键盘：<b>←/→</b> 切换 · <b>空格</b> 收藏。释义与例句直接显示在单词下方，🔊 朗读生词与英文例句走 edge-tts（微软语音，无需 key）；不可用时回退浏览器语音。译文不朗读。</p>
         <p style="margin:4px 0">「分析/生成卡片」按钮把指令草稿填进新对话（不自动发送）；独立浏览器预览时改为复制提示词。</p>
       </div>`
 
@@ -781,7 +970,37 @@
     $app.querySelector('#set-accent').addEventListener('change', (e) => save({ accent: e.target.value }))
     $app.querySelector('#set-max').addEventListener('change', (e) => save({ max_cards: Number(e.target.value) }))
     $app.querySelector('#set-proxy').addEventListener('change', (e) => save({ proxy_url: e.target.value.trim() }))
+    // 独立工作区路径（只为展示；目录不存在时这里会顺手建好）
+    ensureWorkspace().then((ws) => {
+      const el = document.getElementById('set-workspace')
+      if (!el) return
+      el.textContent = ws.path || '（宿主没有提供工作区）'
+      if (!ws.workspaceId) el.textContent += '（未注册为工作区：对话仍开在当前工作区）'
+    })
   }
+
+  // ── 材料行委托（只挂一次：$app 是常驻节点，每次渲染都挂会在点一次时触发多次） ──
+  $app.addEventListener('click', (e) => {
+    const opener = e.target.closest('[data-open]')
+    if (opener) { openLink(opener.dataset.open); return }
+    const act = e.target.closest('button[data-act]')
+    if (act) {
+      const m = (state.catalog?.contents || []).find((x) => x.content_id === act.dataset.id)
+      if (!m) return
+      if (act.dataset.act === 'analyze') {
+        handToAgent(analyzePrompt(m, state.catalog?.settings?.max_cards), m.content_id, m.title)
+      } else {
+        location.hash = `#/learn?id=${encodeURIComponent(m.content_id)}`
+      }
+      return
+    }
+    const b = e.target.closest('button[data-del]')
+    if (!b) return
+    if (!confirm('删除该材料及其卡片？（收藏快照保留）')) return
+    apiDelete(`/api/contents/${encodeURIComponent(b.dataset.del)}`)
+      .then(() => { toast('已删除'); renderHome() })
+      .catch((err) => toast(`删除失败：${err.message}`))
+  })
 
   // ── 宿主握手回执（client.js startSession 结果） ────────────────────────
   addEventListener('message', (e) => {

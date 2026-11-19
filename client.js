@@ -44,9 +44,13 @@ function apply(ctx) {
         if (!frame || e.source !== frame.contentWindow || e.origin !== location.origin) return
         const m = e.data
         if (!m || m.type !== 'seekword:refresh' || typeof m.prompt !== 'string') return
+        // 面板会带上插件独立工作区的 id：有就在那个工作区开对话，没有再退回当前工作区
+        const workspaceId = typeof m.workspaceId === 'string' && m.workspaceId ? m.workspaceId : undefined
         try {
-          ctx.uiWorkspace.startSession(undefined, { prompt: m.prompt, whenDraftExists: 'replace' })
-          try { frame.contentWindow.postMessage({ type: 'seekword:start-ok' }, location.origin) } catch {}
+          ctx.uiWorkspace.startSession(workspaceId, { prompt: m.prompt, whenDraftExists: 'replace' })
+          try {
+            frame.contentWindow.postMessage({ type: 'seekword:start-ok', workspace: workspaceId ? 'plugin' : 'current' }, location.origin)
+          } catch {}
         } catch (err) {
           console.error('[seekword] 开新对话失败', err)
           try { frame.contentWindow.postMessage({ type: 'seekword:start-failed', message: String((err && err.message) || err) }, location.origin) } catch {}

@@ -1,7 +1,7 @@
 {
   "name": "dsh-seekword",
-  "version": "0.2.0",
-  "description": "捕获生词 · AI 驱动的生词预习与闪卡学习：多来源捕获原文（粘贴/YouTube 字幕/本地字幕文件/网页）→ agent 按技能筛选高价值生词并生成学习卡片（音标/词性/释义/双语例句/备注）→ 单词本沉淀 + 侧栏面板学习（卡片翻转/键盘导航/收藏/CSV 导出）。移植自 SeekWord（CaptiPrep 分支）。",
+  "version": "0.2.3",
+  "description": "捕获生词 · AI 驱动的生词预习与闪卡学习：面板四个渠道（粘贴/YouTube 字幕/本地文件/网页）只把材料线索交给 agent，由 agent 自己读取/抓取/转换、按技能筛选高价值生词并生成学习卡片（音标/词性/释义/双语例句/备注），面板负责单词本与闪卡学习（卡片翻转/键盘导航/收藏/CSV 导出）。移植自 SeekWord（CaptiPrep 分支）。",
   "license": "MIT",
   "type": "module",
   "main": "src/host.js",
@@ -60,6 +60,7 @@
     "@deepseek-ai/schemastery": "^3.19.0"
   },
   "devDependencies": {
-    "esbuild": "^0.25.10"
+    "esbuild": "^0.25.10",
+    "jsdom": "^26.1.0"
   }
 }

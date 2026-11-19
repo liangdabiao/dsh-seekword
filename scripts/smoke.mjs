@@ -1,6 +1,6 @@
 // 冒烟测试（离线）：假 YouTube InnerTube 服务器 + 假网页服务器 + 工具直调全链路 + 面板 API 全路由。
 // 运行：npm run smoke
-const { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync } = await import('node:fs')
+const { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync, statSync } = await import('node:fs')
 const { tmpdir } = await import('node:os')
 const { join } = await import('node:path')
 const http = await import('node:http')
@@ -204,8 +204,15 @@ let contentId2 = ''
 const { registerApi } = await import('../lib/api.js')
 const { Writable } = await import('node:stream')
 const { EventEmitter } = await import('node:events')
+// 选文件对话框与 edge-tts 都不真跑：注入桩，只验路由与回执归一
+let fakePick = { ok: true, path: 'D:\\资料\\article.pdf' }
+const ttsFile = join(tmp, 'smoke-tts.mp3')
+writeFileSync(ttsFile, Buffer.from('ID3-fake'))
+let fakeTts = { ok: true, file: ttsFile, cached: true }
+const ttsCalls = []
 const routes = {}
-registerApi({ get: () => undefined, webServer: { register: (r) => { routes[r.path] = r.handler } } }, { config: {} })
+registerApi({ get: () => undefined, webServer: { register: (r) => { routes[r.path] = r.handler } } },
+  { config: {}, picker: async () => fakePick, tts: async (args) => { ttsCalls.push(args); return fakeTts } })
 const req = async (method, path, body) => {
   const reqObj = new EventEmitter()
   reqObj.method = method
@@ -228,6 +235,7 @@ const req = async (method, path, body) => {
 {
   const cat = await req('GET', '/api/catalog')
   check('catalog：统计/材料/设置', cat.status === 200 && cat.json.stats && cat.json.contents.length >= 1 && cat.json.settings.gloss_lang === 'zh_CN', '')
+  check('catalog 暴露选文件能力', typeof cat.json.capabilities?.pickFile === 'boolean', '')
   const one = await req('GET', `/api/contents/${contentId}`)
   check('内容详情带 candidates+cards+favorites', one.status === 200 && one.json.candidates.length === 5 && one.json.cards.length === 4 && one.json.favorites.includes('catastrophic'), '')
 
@@ -250,8 +258,67 @@ const req = async (method, path, body) => {
   const csv404 = await req('GET', `/api/export?content_id=nonexist-xxx`)
   check('导出不存在的材料 404', csv404.status === 404, '')
 
+  // 学会了：卡片离开单词本与材料详情（学习页），进「学会了」栏目；撤销可恢复
+  const learnResp = await req('POST', '/api/learned', { content_id: contentId, term: 'catastrophic' })
+  check('标记学会了', learnResp.status === 200 && learnResp.json.ok && learnResp.json.learned === true, '')
+  const wbAfter = await req('GET', '/api/cards')
+  check('学会了不再出现在单词本', wbAfter.status === 200 && !wbAfter.json.cards.some((c) => c.term === 'catastrophic'), '')
+  const detailAfter = await req('GET', `/api/contents/${contentId}`)
+  check('学会了不再出现在学习页卡片', !detailAfter.json.cards.some((c) => c.term === 'catastrophic'), '')
+  const learnedList = await req('GET', '/api/learned')
+  check('「学会了」栏目能查到该词并带快照',
+    learnedList.status === 200 && learnedList.json.learned.some((l) => l.term === 'catastrophic' && l.snapshot && l.snapshot.definition), '')
+  const catAfter = await req('GET', '/api/catalog')
+  check('总览：学习卡片排除已学会 + 学会计数',
+    catAfter.json.stats.learned >= 1 && catAfter.json.stats.cards === wbAfter.json.cards.length,
+    `cards=${catAfter.json.stats.cards} learned=${catAfter.json.stats.learned}`)
+  const restoreLearned = await req('POST', '/api/learned/remove', { term: 'catastrophic' })
+  check('撤销学会了', restoreLearned.status === 200 && restoreLearned.json.restored === true, '')
+  const wbBack = await req('GET', '/api/cards')
+  check('撤销后回到单词本', wbBack.json.cards.some((c) => c.term === 'catastrophic'), '')
+  const learnNoTerm = await req('POST', '/api/learned', { content_id: contentId })
+  check('学会了缺 term → 400', learnNoTerm.status === 400, '')
+
   const open = await req('POST', '/api/open', { url: 'http://127.0.0.1/x' })
   check('open 拒绝本机地址', open.status === 400, '')
+
+  // 选文件：只回绝对路径（不读文件内容），取消/不支持都按「不是失败」处理
+  fakePick = { ok: true, path: 'D:\\资料\\article.pdf' }
+  const pick = await req('POST', '/api/pick', { title: '选择要学的文件' })
+  check('选文件回绝对路径 + exists 标记',
+    pick.status === 200 && pick.json.ok && pick.json.path === 'D:\\资料\\article.pdf' && typeof pick.json.exists === 'boolean', pick.json?.path || '')
+  fakePick = { ok: false, cancelled: true }
+  const pickCancel = await req('POST', '/api/pick', {})
+  check('选文件取消：ok=false + cancelled', pickCancel.status === 200 && pickCancel.json.ok === false && pickCancel.json.cancelled === true, '')
+  fakePick = { ok: false, error: '当前系统暂不支持弹窗选文件，请直接填写文件路径' }
+  const pickBad = await req('POST', '/api/pick', {})
+  check('选文件不支持：错误文案原样回给页面', pickBad.status === 200 && pickBad.json.ok === false && pickBad.json.error.includes('不支持'), '')
+  fakePick = { ok: true, path: 'D:\\资料\\article.pdf' }
+
+  // 朗读：edge-tts 合成结果（注入桩，不真跑 python）
+  ttsCalls.length = 0
+  const ttsOk = await req('GET', '/api/tts?text=resilient&lang=en&accent=uk')
+  check('朗读走 edge-tts 路由：回 mp3 字节', ttsOk.status === 200 && ttsOk.text() === 'ID3-fake', `status=${ttsOk.status}`)
+  check('朗读把语言与口音透传给合成器',
+    ttsCalls[0]?.text === 'resilient' && ttsCalls[0]?.lang === 'en' && ttsCalls[0]?.accent === 'uk',
+    JSON.stringify(ttsCalls[0] || {}))
+  fakeTts = { ok: false, status: 502, error: 'edge-tts 合成超时' }
+  const ttsBad = await req('GET', '/api/tts?text=resilient')
+  check('朗读失败回 502（面板据此回退浏览器语音）', ttsBad.status === 502 && /超时/.test(ttsBad.json?.error || ''), '')
+  fakeTts = { ok: false, status: 400, error: '没有要朗读的文本' }
+  const ttsEmpty = await req('GET', '/api/tts?text=')
+  check('朗读空文本 400', ttsEmpty.status === 400, '')
+  fakeTts = { ok: true, file: ttsFile, cached: true }
+
+  // 独立工作区：目录建好并回给面板（本进程没有 workspaceRegistry，workspaceId 为空 = 退回当前工作区）
+  const ws = await req('GET', '/api/workspace')
+  const wsDir = ws.json?.path || ''
+  check('独立工作区：返回目录并确保存在',
+    ws.status === 200 && ws.json.ok && wsDir.length > 0 && existsSync(wsDir),
+    wsDir)
+  check('独立工作区：没有 registry 时不编造 workspaceId', ws.json.workspaceId === '', JSON.stringify(ws.json))
+  const wsStat = statSync(wsDir)
+  check('独立工作区：确实是目录', wsStat.isDirectory(), '')
 
   const page = await req('GET', '/')
   check('面板首页可访问', page.status === 200 && page.text().includes('app.js'), '')
@@ -264,8 +331,28 @@ const req = async (method, path, body) => {
   check('lab 消息类型与 client 对齐', appjsFile.includes('seekword:refresh') && clientFile.includes('seekword:refresh') && appjsFile.includes('seekword:start-ok') && clientFile.includes('seekword:start-ok'), '')
   check('面板主入口齐备（4渠道+执行按钮+2s轮询）',
     appjsFile.includes("['file', '📁 选择文件']") && appjsFile.includes('粘贴文本') && appjsFile.includes('YouTube') && appjsFile.includes('网页')
-    && appjsFile.includes('① 分析生词') && appjsFile.includes('② 生成卡片') && appjsFile.includes('id="cap-go"')
+    && appjsFile.includes('① 分析生词') && appjsFile.includes('② 生成卡片') && appjsFile.includes('class="primary cap-go"')
     && appjsFile.includes('setInterval(pollOnce, 2000)') && appjsFile.includes('startWaiting'),
+    '')
+  check('独立工作区接线：面板带 workspaceId、client 用它开对话',
+    appjsFile.includes('/api/workspace') && appjsFile.includes('workspaceId')
+    && clientFile.includes('m.workspaceId') && clientFile.includes('startSession(workspaceId'),
+    '')
+  // 导入区要极简：一个输入 + 一个「分析」按钮，没有标题输入、没有说明段落
+  check('导入区极简（无标题输入/无说明段落）',
+    !appjsFile.includes('cap-title') && !appjsFile.includes('id="cap-pick-hint">面板')
+    && (appjsFile.match(/class="primary cap-go"/g) || []).length === 4,
+    '')
+  const capRoute = await req('POST', '/api/capture', { source: 'text', text: 'hello world' })
+  check('面板不再提供 /api/capture（入库归 agent）', capRoute.status === 404, '')
+  // 导入区四个渠道必须是纯交接：面板只把材料线索写进草稿交给 agent
+  check('导入区四个渠道都只做交接',
+    appjsFile.includes("apiPost('/api/pick'") && appjsFile.includes('importFilePrompt')
+    && appjsFile.includes('importTextPrompt') && appjsFile.includes('importUrlPrompt')
+    && appjsFile.includes('source="file"') && appjsFile.includes('source="text"')
+    && appjsFile.includes('source="${kind}"') && appjsFile.includes('startWatchingNew')
+    && !appjsFile.includes('cap-file-input') && !appjsFile.includes('blob.text()') && !appjsFile.includes('getPathForFile')
+    && !appjsFile.includes("apiPost('/api/capture'"),
     '')
 }
 
