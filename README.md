@@ -3,6 +3,12 @@
 > 先学再看（Pre-exposure）：从任意语言内容里先捕获高价值生词、生成学习卡片，再带着上下文去阅读/观看——学得更快、记得更牢。
 > 移植自 Chrome 扩展 [SeekWord](https://github.com/liangdabiao/SeekWord)（CaptiPrep 分支）为 dsh 插件。
 
+<img width="2103" height="1368" alt="image" src="https://github.com/user-attachments/assets/993c3b0e-4858-4b4c-b2ff-2b8a96759672" />
+<img width="1629" height="1329" alt="image" src="https://github.com/user-attachments/assets/adf001f7-1de2-49c7-b496-e15573bbafea" />
+<img width="1737" height="1374" alt="image" src="https://github.com/user-attachments/assets/bad72268-6d6d-4f70-8093-d6871dc46af1" />
+
+
+
 ## 安装
 
 ```bash
