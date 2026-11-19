@@ -1,0 +1,5 @@
+# 捕获生词：seekword 工具（原文捕获/生词卡片/单词本/导出）+ seekword 技能 + 侧栏面板。
+# 浏览器半边由 dsh.client 声明加载。
+- insert:
+    - id: seekword
+      name: 'dsh-seekword'
