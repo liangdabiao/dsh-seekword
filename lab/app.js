@@ -1,6 +1,6 @@
-// 捕获生词 · 面板逻辑：概览（捕获表单+材料列表）/ 学习（候选勾选+闪卡+键盘导航）/ 单词本（过滤+导出）/ 设置。
-// 「生成卡片」走 agent：嵌入 dsh → postMessage（client.js startSession，有 start-ok 握手）；
-// 独立浏览器预览 → 复制草稿。面板直连 API 捕获/查卡/收藏/导出 CSV。
+// 捕获生词 · 面板逻辑：导入区（4 渠道+执行按钮）/ 学习（材料状态机：①分析→②制卡→③闪卡）/ 单词本 / 设置。
+// 「分析生词」「生成卡片」走 agent：嵌入 dsh → postMessage（client.js startSession 填草稿不自动发送）；
+// 独立浏览器预览 → 复制提示词。点按钮后面板每 2 秒轻量轮询，agent 入库自动刷新视图。
 (() => {
   const $app = document.getElementById('app')
   const $toast = document.getElementById('toast')
@@ -9,10 +9,12 @@
   const state = {
     catalog: null,
     view: 'home',
-    learn: null,        // { id, meta, candidates, cards, favorites, idx, flipped, grid }
+    learn: null,        // { id, meta, sourceText, candidates, cards, favorites, idx, flipped, grid }
     wb: { q: '', fav: false, source: '', cards: [], total: 0 },
-    capture: { tab: 'text' },
+    capture: { tab: 'file', file: null },
+    waiting: null,      // { contentId, title, baseline:{cand,cards}, since }
   }
+  let pollTimer = null
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
 
   async function api(path) {
@@ -64,7 +66,7 @@
     $toast.textContent = msg
     $toast.classList.add('show')
     clearTimeout(toastTimer)
-    toastTimer = setTimeout(() => $toast.classList.remove('show'), 2600)
+    toastTimer = setTimeout(() => $toast.classList.remove('show'), 3200)
   }
 
   const SRC_LABEL = { text: '粘贴', youtube: 'YouTube', web: '网页', file: '文件' }
@@ -73,6 +75,103 @@
     ['ko', '한국어'], ['ru', 'Русский'], ['fr', 'Français'], ['de', 'Deutsch'], ['es', 'Español'],
   ]
   const TTS_LANG = { en: 'en-US', zh_CN: 'zh-CN', zh_TW: 'zh-TW', ja: 'ja-JP', ko: 'ko-KR', ru: 'ru-RU', fr: 'fr-FR', de: 'de-DE', es: 'es-ES' }
+
+  // ── 材料状态机：imported(待分析) → candidates(待制卡) → cards(可学习) ──
+  function nextStepOf(m) {
+    if ((m.card_count || 0) > 0) return 'cards'
+    if ((m.candidate_count || 0) > 0) return 'candidates'
+    return 'imported'
+  }
+  const STEP_META = {
+    imported: { label: '待分析', btn: '① 分析生词', act: 'analyze', cls: 'primary' },
+    candidates: { label: '待制卡', btn: '② 选词制卡', act: 'make', cls: 'primary' },
+    cards: { label: '可学习', btn: '去学习', act: 'learn', cls: '' },
+  }
+
+  // ── agent 提示词与交接 ────────────────────────────────────────────────
+  function analyzePrompt(m, maxCards) {
+    return `给《${m.title}》分析生词（contentId=${m.content_id}）。\n` +
+      `请按 seekword 技能执行：用 seekword(action="read", contentId="${m.content_id}") 分段通读原文 → ` +
+      `按筛选规则挑最多 ${maxCards || 30} 个高价值生词（term 必须是原文表面形式，宁缺毋滥）→ ` +
+      `seekword(action="save_candidates", contentId="${m.content_id}", terms=[...]) 入库 → 给我候选词清单。`
+  }
+  function makeCardsPrompt(m, terms) {
+    return `给《${m.title}》生成学习卡片（contentId=${m.content_id}）。\n` +
+      `用户选定了这些候选词：${terms.join('、')}。\n` +
+      `请按 seekword 技能的制卡规则，为每个词生成卡片（发音/词性/贴合原文语境的释义/两组双语例句/语法备注），` +
+      `然后调 seekword(action="save_cards", contentId="${m.content_id}", cards=[...], selected=[...]) 入库，最后按技能输出规则给出卡片清单。`
+  }
+  async function handToAgent(prompt, waitingId, waitingTitle) {
+    if (EMBEDDED) {
+      try {
+        window.parent.postMessage({ type: 'seekword:refresh', prompt }, location.origin)
+        toast('已交给对话：草稿已填入，点「发送」后 agent 开始（面板每 2 秒自动检查入库）')
+      } catch {
+        try { await navigator.clipboard.writeText(prompt); toast('交给对话失败：提示词已复制，请粘贴发送') } catch { toast('交给对话失败') }
+      }
+    } else {
+      try { await navigator.clipboard.writeText(prompt); toast('独立预览模式：提示词已复制，去对话粘贴后发送') } catch { toast('复制失败：请手动复制提示词') }
+    }
+    if (waitingId) startWaiting(waitingId, waitingTitle)
+  }
+
+  // ── 等待 agent：2s 轻量轮询 catalog，入库自动刷新 ─────────────────────
+  function startWaiting(contentId, title) {
+    const m = state.catalog?.contents.find((x) => x.content_id === contentId)
+    stopWaiting()
+    state.waiting = {
+      contentId,
+      title: title || m?.title || '',
+      baseline: { cand: m?.candidate_count || 0, cards: m?.card_count || 0 },
+      since: Date.now(),
+    }
+    pollTimer = setInterval(pollOnce, 2000)
+    paintWaitingBar()
+  }
+  function stopWaiting() {
+    if (pollTimer) clearInterval(pollTimer)
+    pollTimer = null
+    state.waiting = null
+  }
+  async function pollOnce() {
+    if (!state.waiting) return
+    try {
+      const c = await api('/api/catalog')
+      state.catalog = c
+      paintCounts()
+      const mm = c.contents.find((x) => x.content_id === state.waiting?.contentId)
+      if (!mm) return
+      const grown = (mm.candidate_count || 0) > state.waiting.baseline.cand
+        || (mm.card_count || 0) > state.waiting.baseline.cards
+      if (grown) {
+        const refreshView = state.view
+        stopWaiting()
+        toast('agent 已入库，视图已刷新')
+        if (refreshView === 'learn') await renderLearn(mm.content_id)
+        else if (refreshView === 'home') await renderHome()
+        paintWaitingBar()
+      } else if (Date.now() - state.waiting.since > 120000) {
+        stopWaiting()
+        toast('等待超时（2 分钟无入库）：agent 可能还没跑完，完成后点材料上的执行按钮即可')
+        paintWaitingBar()
+      }
+    } catch { /* 网络抖动忽略，下一轮再试 */ }
+  }
+  function paintWaitingBar() {
+    const slot = document.getElementById('waiting-slot')
+    if (!slot) return
+    slot.innerHTML = state.waiting ? `
+      <div class="waiting-bar" id="waiting-bar">
+        <span class="spin">⏳</span>
+        <span>等待 agent 入库：<b>${esc(state.waiting.title)}</b>（每 2 秒自动检查）</span>
+        <button class="ghost" id="waiting-cancel">取消等待</button>
+      </div>` : ''
+    document.getElementById('waiting-cancel')?.addEventListener('click', () => {
+      stopWaiting()
+      paintWaitingBar()
+      toast('已取消自动检查（agent 入库后手动点材料按钮即可）')
+    })
+  }
 
   // ── TTS（浏览器语音，本地合成） ────────────────────────────────────────
   function speak(text, lang) {
@@ -97,12 +196,14 @@
     const query = new URLSearchParams(queryPart || '')
     const view = (pathPart === '/' || pathPart === '') ? 'home' : pathPart.slice(1)
     state.view = view
+    if (view === 'wordbook' || view === 'settings') stopWaiting()
     for (const a of document.querySelectorAll('.nav a')) a.classList.toggle('active', a.dataset.view === view)
     try {
       if (view === 'learn') await renderLearn(query.get('id'))
       else if (view === 'wordbook') await renderWordbook()
       else if (view === 'settings') renderSettings()
       else await renderHome()
+      paintWaitingBar()
     } catch (e) {
       $app.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`
     }
@@ -121,16 +222,23 @@
     for (const el of document.querySelectorAll('[data-count]')) el.textContent = map[el.dataset.count] ?? ''
   }
 
-  // ── 概览 ───────────────────────────────────────────────────────────────
+  // ── 概览：导入区（4 渠道）+ 材料列表（状态机执行按钮） ─────────────────
   async function renderHome() {
     const cat = await loadCatalog(true)
     const s = cat.stats
     const contents = cat.contents || []
     const tab = state.capture.tab
 
+    const TABS = [
+      ['file', '📁 选择文件'],
+      ['text', '粘贴文本'],
+      ['youtube', 'YouTube'],
+      ['web', '网页'],
+    ]
     $app.innerHTML = `
       <h1>捕获生词</h1>
-      <p class="sub">先学再看：捕获原文 → 筛选生词 → 生成卡片 → 面板翻卡复习。数据目录 <span class="mono">${esc(cat.dataDir)}</span></p>
+      <p class="sub">导入 → 点「① 分析生词」交给 agent 筛选制卡 → 面板翻卡复习。数据目录 <span class="mono">${esc(cat.dataDir)}</span></p>
+      <div id="waiting-slot"></div>
       <div class="grid2">
         <div class="card stat"><div class="num">${s.contents}</div><div class="lbl">捕获材料</div></div>
         <div class="card stat"><div class="num">${s.cards}</div><div class="lbl">学习卡片</div></div>
@@ -138,52 +246,61 @@
         <div class="card stat"><div class="num">${latestLabel(contents[0])}</div><div class="lbl">最近材料</div></div>
       </div>
 
-      <h2>新建捕获</h2>
+      <h2>导入内容</h2>
       <div class="card">
         <div class="tabs" id="cap-tabs">
-          ${['text', 'youtube', 'web', 'file'].map((t) => `<button data-tab="${t}" class="${tab === t ? 'on' : ''}">${SRC_LABEL[t]}</button>`).join('')}
+          ${TABS.map(([t, n]) => `<button data-tab="${t}" class="${tab === t ? 'on' : ''}">${n}</button>`).join('')}
+        </div>
+        <div class="field ${tab === 'file' ? '' : 'hide'}" data-field="file">
+          <input type="file" id="cap-file-input" accept=".txt,.md,.srt,.vtt,.json3,.json,text/plain" style="display:none">
+          <div class="row">
+            <button id="cap-pick">选择文件…</button>
+            <span class="muted" style="font-size:12px">支持 txt / md / srt / vtt / json3 字幕与文本</span>
+          </div>
+          <div id="cap-file-chip" style="margin-top:8px"></div>
         </div>
         <div class="field ${tab === 'text' ? '' : 'hide'}" data-field="text">
           <label>原文（粘贴任意语言文本）</label>
           <textarea id="cap-text" placeholder="粘贴要学的文章/字幕/段落……"></textarea>
         </div>
         <div class="field ${tab === 'youtube' ? '' : 'hide'}" data-field="youtube">
-          <label>YouTube 视频链接或 videoId（自动抓字幕，多客户端降级）</label>
+          <label>YouTube 视频链接或 videoId（自动抓字幕，多客户端降级；国内网络可在设置页配代理）</label>
           <input id="cap-url" style="width:100%" placeholder="https://www.youtube.com/watch?v=...">
         </div>
         <div class="field ${tab === 'web' ? '' : 'hide'}" data-field="web">
           <label>网页链接（http/https，自动提取正文）</label>
           <input id="cap-url" style="width:100%" placeholder="https://example.com/article">
         </div>
-        <div class="field ${tab === 'file' ? '' : 'hide'}" data-field="file">
-          <label>本地文件路径（txt / md / srt / vtt / json3）</label>
-          <input id="cap-path" style="width:100%" placeholder="D:/subtitles/lesson01.srt">
+        <div class="row" style="margin-top:10px">
+          <input id="cap-title" placeholder="标题（可留空自动取）" style="flex:1;min-width:180px">
+          <button class="primary" id="cap-go">导入</button>
         </div>
-        <div class="row end">
-          <span class="muted" style="margin-right:auto;font-size:12px">捕获后到「学习」页筛选生词、生成卡片</span>
-          <button class="primary" id="cap-go">捕获</button>
-        </div>
+        <div class="muted" style="font-size:12px;margin-top:6px">导入后自动跳到「学习」页，点「① 分析生词」交给 agent 筛选制卡。</div>
       </div>
 
-      <h2>材料列表<span class="muted" style="font-weight:400;font-size:12px">（新→旧）</span></h2>
+      <h2>材料列表<span class="muted" style="font-weight:400;font-size:12px">（新→旧 · 状态列即下一步按钮）</span></h2>
       <div class="card" style="padding:6px 10px">
         ${contents.length ? `<table>
-          <thead><tr><th>材料</th><th>来源</th><th>语言</th><th>字符</th><th>候选</th><th>卡片</th><th>日期</th><th></th></tr></thead>
+          <thead><tr><th>材料</th><th>来源</th><th>语言</th><th>字符</th><th>候选</th><th>卡片</th><th>状态</th><th>日期</th><th></th></tr></thead>
           <tbody>
-            ${contents.map((m) => `<tr>
+            ${contents.map((m) => {
+              const step = nextStepOf(m)
+              const sm = STEP_META[step]
+              return `<tr>
               <td><a href="#/learn?id=${encodeURIComponent(m.content_id)}" style="color:var(--ink);font-weight:600;text-decoration:none">${esc(m.title)}</a>${m.source_url ? `<div class="muted mono" style="font-size:11px"><a href="javascript:void 0" data-open="${esc(m.source_url)}">${esc(m.source_url.slice(0, 60))}</a></div>` : ''}</td>
               <td><span class="badge src-${esc(m.source)}">${SRC_LABEL[m.source] || esc(m.source)}</span></td>
               <td class="mono">${esc(m.lang)}</td>
               <td class="mono">${m.chars}</td>
               <td class="mono">${m.candidate_count || 0}</td>
               <td class="mono">${m.card_count}</td>
+              <td><span class="badge st-${step}">${sm.label}</span></td>
               <td class="muted mono">${esc(m.created_day)}</td>
-              <td><button class="ghost" data-del="${esc(m.content_id)}" title="删除材料">✕</button></td>
-            </tr>`).join('')}
+              <td class="stepcell"><button class="${sm.cls}" data-act="${sm.act}" data-id="${esc(m.content_id)}">${sm.btn}</button> <button class="ghost" data-del="${esc(m.content_id)}" title="删除材料">✕</button></td>
+            </tr>`
+            }).join('')}
           </tbody>
-        </table>` : '<div class="empty">还没有材料。上方粘贴一段文本试试。</div>'}
-      </div>
-      <div id="rail-foot-slot"></div>`
+        </table>` : '<div class="empty">还没有材料。选择一个文件、或粘贴一段文本，点「导入」。</div>'}
+      </div>`
 
     // tabs
     $app.querySelector('#cap-tabs').addEventListener('click', (e) => {
@@ -192,70 +309,130 @@
       state.capture.tab = b.dataset.tab
       renderHome()
     })
-    // 捕获提交
-    $app.querySelector('#cap-go').addEventListener('click', async () => {
-      const tab = state.capture.tab
-      const payload = { source: tab }
-      if (tab === 'text') {
-        payload.text = $app.querySelector('#cap-text').value.trim()
-        if (!payload.text) return toast('先粘贴原文')
-      } else if (tab === 'file') {
-        payload.path = $app.querySelector('#cap-path').value.trim()
-        if (!payload.path) return toast('填本地文件路径')
-      } else {
-        payload.url = $app.querySelector('#cap-url').value.trim()
-        if (!payload.url) return toast('填链接')
+
+    // 文件选择（Electron 里 File.path 可取本地路径；取不到则前端读内容降级 text 通道）
+    $app.querySelector('#cap-pick').addEventListener('click', () => $app.querySelector('#cap-file-input').click())
+    $app.querySelector('#cap-file-input').addEventListener('change', (e) => {
+      const f = e.target.files && e.target.files[0]
+      if (!f) return
+      let realPath = ''
+      try { realPath = f.path || '' } catch { realPath = '' }
+      if (!realPath && window.webUtils?.getPathForFile) {
+        try { realPath = window.webUtils.getPathForFile(f) || '' } catch { realPath = '' }
       }
-      const btn = $app.querySelector('#cap-go')
-      btn.disabled = true
-      btn.textContent = '捕获中…'
-      try {
-        const r = await apiPost('/api/capture', payload)
-        toast(`已捕获《${r.meta.title}》`)
-        await loadCatalog(true)
-        location.hash = `#/learn?id=${encodeURIComponent(r.meta.content_id)}`
-      } catch (e) {
-        toast(`捕获失败：${e.message}`)
-        btn.disabled = false
-        btn.textContent = '捕获'
-      }
+      state.capture.file = { name: f.name, size: f.size, path: realPath, blob: f }
+      paintFileChip()
     })
-    // 删除材料 / 打开原文链接
-    $app.addEventListener('click', async (e) => {
+    paintFileChip()
+
+    // 导入（执行按钮）
+    $app.querySelector('#cap-go').addEventListener('click', doImport)
+
+    // 材料行：执行按钮 / 删除 / 打开原文链接
+    $app.addEventListener('click', (e) => {
       const opener = e.target.closest('[data-open]')
       if (opener) { openLink(opener.dataset.open); return }
+      const act = e.target.closest('button[data-act]')
+      if (act) {
+        const m = contents.find((x) => x.content_id === act.dataset.id)
+        if (!m) return
+        if (act.dataset.act === 'analyze') {
+          handToAgent(analyzePrompt(m, cat.settings?.max_cards), m.content_id, m.title)
+        } else {
+          location.hash = `#/learn?id=${encodeURIComponent(m.content_id)}`
+        }
+        return
+      }
       const b = e.target.closest('button[data-del]')
       if (!b) return
       if (!confirm('删除该材料及其卡片？（收藏快照保留）')) return
-      try {
-        await apiDelete(`/api/contents/${encodeURIComponent(b.dataset.del)}`)
-        toast('已删除')
-        renderHome()
-      } catch (err) { toast(`删除失败：${err.message}`) }
+      apiDelete(`/api/contents/${encodeURIComponent(b.dataset.del)}`)
+        .then(() => { toast('已删除'); renderHome() })
+        .catch((err) => toast(`删除失败：${err.message}`))
     }, { once: true })
+  }
+
+  function paintFileChip() {
+    const chip = $app.querySelector('#cap-file-chip')
+    if (!chip) return
+    const f = state.capture.file
+    if (!f) { chip.innerHTML = ''; return }
+    const kb = f.size > 1024 * 1024 ? `${(f.size / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(f.size / 1024))} KB`
+    const hasPath = f.path && /^([a-zA-Z]:[\\/]|\/)/.test(f.path)
+    chip.innerHTML = `
+      <span class="filechip">📄 <b>${esc(f.name)}</b>（${kb}）· ${hasPath ? '路径已获取，直接导入' : '浏览器拿不到本地路径，将读取内容导入'}
+        <span class="x" id="cap-file-clear" title="清除">✕</span></span>`
+    chip.querySelector('#cap-file-clear')?.addEventListener('click', () => {
+      state.capture.file = null
+      const input = $app.querySelector('#cap-file-input')
+      if (input) input.value = ''
+      paintFileChip()
+    })
+  }
+
+  async function doImport() {
+    const tab = state.capture.tab
+    const titleEl = $app.querySelector('#cap-title')
+    const title = titleEl?.value.trim() || ''
+    const payload = { title }
+    if (tab === 'file') {
+      const f = state.capture.file
+      if (!f) return toast('先选择文件')
+      if (f.path && /^([a-zA-Z]:[\\/]|\/)/.test(f.path)) {
+        payload.source = 'file'
+        payload.path = f.path
+      } else {
+        try {
+          payload.source = 'text'
+          payload.text = await f.blob.text()
+        } catch (e) { return toast(`读取文件内容失败：${e.message}`) }
+      }
+    } else if (tab === 'text') {
+      payload.source = 'text'
+      payload.text = $app.querySelector('#cap-text').value.trim()
+      if (!payload.text) return toast('先粘贴原文')
+    } else {
+      payload.source = tab
+      payload.url = $app.querySelector('#cap-url').value.trim()
+      if (!payload.url) return toast('先填链接')
+    }
+    const btn = $app.querySelector('#cap-go')
+    btn.disabled = true
+    btn.textContent = '导入中…'
+    try {
+      const r = await apiPost('/api/capture', payload)
+      toast(`已导入《${r.meta.title}》：到学习页点「① 分析生词」`)
+      await loadCatalog(true)
+      location.hash = `#/learn?id=${encodeURIComponent(r.meta.content_id)}`
+    } catch (e) {
+      toast(`导入失败：${e.message}`)
+      btn.disabled = false
+      btn.textContent = '导入'
+    }
   }
 
   function latestLabel(m) {
     return m ? `<span style="font-size:14px">${esc(String(m.title).slice(0, 14))}</span>` : '—'
   }
 
-  // ── 学习 ───────────────────────────────────────────────────────────────
+  // ── 学习：材料状态机（①分析 → ②选词制卡 → ③闪卡） ───────────────────
   async function renderLearn(id) {
     const cat = await loadCatalog()
     const contents = cat.contents || []
     if (!contents.length) {
-      $app.innerHTML = `<h1>学习</h1><div class="empty">还没有材料。先到「概览」捕获一段内容。</div>`
+      $app.innerHTML = `<h1>学习</h1><div id="waiting-slot"></div><div class="empty">还没有材料。先到「概览」导入一段内容。</div>`
       return
     }
     const target = id ? contents.find((m) => m.content_id === id) : contents[0]
     if (!target) {
-      $app.innerHTML = `<h1>学习</h1><div class="empty">材料不存在（可能已删除）。<a href="#/learn">回学习页</a></div>`
+      $app.innerHTML = `<h1>学习</h1><div id="waiting-slot"></div><div class="empty">材料不存在（可能已删除）。<a href="#/learn">回学习页</a></div>`
       return
     }
     const detail = await api(`/api/contents/${encodeURIComponent(target.content_id)}`)
     state.learn = {
       id: target.content_id,
       meta: detail.meta,
+      sourceText: detail.source_text || '',
       candidates: detail.candidates || [],
       cards: detail.cards || [],
       favorites: new Set(detail.favorites || []),
@@ -271,41 +448,47 @@
     if (!L) return
     const cat = state.catalog
     const contents = cat.contents || []
+    const step = nextStepOf(L.meta)
     const candCount = L.candidates.length
     const cardCount = L.cards.length
-    const settings = cat.settings || {}
 
     $app.innerHTML = `
       <h1>学习</h1>
+      <div id="waiting-slot"></div>
       <div class="learn-head">
         <select id="learn-select">${contents.map((m) => `<option value="${esc(m.content_id)}" ${m.content_id === L.id ? 'selected' : ''}>${esc(m.title)}</option>`).join('')}</select>
         <span class="badge">${SRC_LABEL[L.meta.source] || esc(L.meta.source)}</span>
         <span class="badge">${esc(L.meta.lang)}</span>
-        ${cardCount ? `<span class="muted">${cardCount} 卡 · 候选 ${candCount}</span>` : ''}
+        <span class="badge st-${step}">${STEP_META[step].label}</span>
+        <span class="muted">${cardCount} 卡 · 候选 ${candCount}</span>
         <span style="margin-left:auto" class="row">
+          ${step !== 'imported' ? `<button class="ghost" id="act-reanalyze">重新分析</button>` : ''}
           ${cardCount ? `<button id="learn-grid">${L.grid ? '卡片视图' : '网格视图'}</button>` : ''}
           ${cardCount ? `<button id="learn-export">导出 CSV</button>` : ''}
         </span>
       </div>
 
-      ${!cardCount && !candCount ? `
-        <div class="empty">
-          《${esc(L.meta.title)}》还没有候选词。<br><br>
-          回到对话对 agent 说：<b>“给《${esc(L.meta.title)}》挑生词做卡片”</b>（contentId=<span class="mono">${esc(L.id)}</span>），<br>
-          agent 会按 seekword 技能筛选高价值生词并生成学习卡片。
+      ${step === 'imported' ? `
+        <div class="card step-card">
+          <h2 style="margin:0 0 6px">第 1 步 · 分析生词</h2>
+          <p class="muted" style="margin:0 0 10px">把原文交给对话里的 agent：按 seekword 技能通读全文、筛选高价值生词并入库。候选词会回到这里（面板每 2 秒自动检查入库）。</p>
+          ${L.sourceText ? `<div class="muted mono src-preview">${esc(L.sourceText.slice(0, 300))}${L.sourceText.length > 300 ? '…' : ''}</div>` : ''}
+          <div class="row end" style="margin-top:10px">
+            <button class="primary" id="act-analyze">① 分析生词</button>
+          </div>
         </div>` : ''}
 
-      ${!cardCount && candCount ? `
-        <div class="card">
-          <h2 style="margin:0 0 6px">候选生词（${candCount}）</h2>
-          <p class="muted" style="margin:0">勾选要学的词（默认全选），点「生成卡片」交给 agent 制卡。</p>
+      ${step === 'candidates' ? `
+        <div class="card step-card">
+          <h2 style="margin:0 0 6px">第 2 步 · 选词制卡（候选 ${candCount}）</h2>
+          <p class="muted" style="margin:0">勾选要学的词（默认全选），点「② 生成卡片」交给 agent 制卡。</p>
           <div class="cand-list" id="cand-list">
             ${L.candidates.map((c, i) => `
               <span class="cand on" data-cand="${i}">${esc(c.term)}<span class="tag">${c.type === 'phrase' ? '短语' : '词'}</span></span>`).join('')}
           </div>
           <div class="row end">
             <button class="ghost" id="cand-all">全选 / 全不选</button>
-            <button class="primary" id="cand-go">生成卡片</button>
+            <button class="primary" id="cand-go">② 生成卡片</button>
           </div>
         </div>` : ''}
 
@@ -314,8 +497,14 @@
     $app.querySelector('#learn-select').addEventListener('change', (e) => {
       location.hash = `#/learn?id=${encodeURIComponent(e.target.value)}`
     })
+    $app.querySelector('#act-analyze')?.addEventListener('click', () => {
+      handToAgent(analyzePrompt(L.meta, cat.settings?.max_cards), L.id, L.meta.title)
+    })
+    $app.querySelector('#act-reanalyze')?.addEventListener('click', () => {
+      handToAgent(analyzePrompt(L.meta, cat.settings?.max_cards), L.id, L.meta.title)
+    })
 
-    if (!cardCount && candCount) {
+    if (step === 'candidates') {
       const listEl = $app.querySelector('#cand-list')
       listEl.addEventListener('click', (e) => {
         const c = e.target.closest('[data-cand]')
@@ -329,32 +518,15 @@
       $app.querySelector('#cand-go').addEventListener('click', () => {
         const terms = [...listEl.querySelectorAll('.cand.on')].map((x) => L.candidates[Number(x.dataset.cand)].term)
         if (!terms.length) return toast('至少勾选一个词')
-        startMakeCards(terms)
+        handToAgent(makeCardsPrompt(L.meta, terms), L.id, L.meta.title)
       })
     }
 
-    if (cardCount) {
+    if (step === 'cards') {
       $app.querySelector('#learn-grid')?.addEventListener('click', () => { L.grid = !L.grid; L.flipped = false; paintLearn() })
       $app.querySelector('#learn-export')?.addEventListener('click', () => downloadCsv(`content_id=${encodeURIComponent(L.id)}`, L.meta.title))
       paintFlash()
       bindFlashKeys()
-    }
-    void settings
-  }
-
-  async function startMakeCards(terms) {
-    const L = state.learn
-    const prompt =
-      `给《${L.meta.title}》生成学习卡片（contentId=${L.id}）。\n` +
-      `用户选定了这些候选词：${terms.join('、')}。\n` +
-      `请按 seekword 技能的制卡规则，为每个词生成卡片（发音/词性/贴合原文语境的释义/两组双语例句/语法备注），然后调 seekword(action="save_cards", contentId="${L.id}", cards=[...], selected=[...]) 入库，最后按技能输出规则给出卡片清单。`
-    if (EMBEDDED) {
-      try {
-        window.parent.postMessage({ type: 'seekword:refresh', prompt }, location.origin)
-        toast('已交给对话（未自动发送）')
-      } catch { toast('交给对话失败') }
-    } else {
-      try { await navigator.clipboard.writeText(prompt); toast('独立预览模式：提示词已复制，去对话粘贴') } catch { toast('复制失败') }
     }
   }
 
@@ -447,7 +619,7 @@
     state._keysBound = true
     addEventListener('keydown', (e) => {
       if (state.view !== 'learn' || !state.learn) return
-      if (state.learn.grid) return
+      if (nextStepOf(state.learn.meta) !== 'cards' || state.learn.grid) return
       const tag = document.activeElement?.tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
       if (e.key === 'ArrowLeft') { e.preventDefault(); stepFlash(-1) }
@@ -526,7 +698,7 @@
   }
 
   function wbTable(cards) {
-    if (!cards.length) return '<div class="empty">没有匹配的卡片。先捕获材料、生成卡片。</div>'
+    if (!cards.length) return '<div class="empty">没有匹配的卡片。先导入材料、生成卡片。</div>'
     return `<table>
       <thead><tr><th></th><th>生词</th><th>读音/音标</th><th>词性</th><th>释义</th><th>材料</th></tr></thead>
       <tbody>${cards.map((c) => `<tr>
@@ -591,8 +763,9 @@
       </div>
       <h2>学习方式</h2>
       <div class="card muted" style="max-width:560px;font-size:13px">
-        <p style="margin:4px 0">学习页闪卡支持键盘：<b>←/→</b> 切换卡片 · <b>空格</b> 收藏当前词 · 点击卡片翻转释义。🔊 按钮用浏览器本地语音朗读（无需 API key）。</p>
-        <p style="margin:4px 0">「生成卡片」按钮会把选定的候选词交给对话里的 agent 按 seekword 技能制卡（嵌入 dsh 时自动填入新对话草稿）。</p>
+        <p style="margin:4px 0"><b>导入 → 分析 → 学习</b>：概览页四渠道导入（文件/粘贴/YouTube/网页）→ 材料列表或学习页点「① 分析生词」交给 agent → 候选回面板勾选 → 「② 生成卡片」→ 闪卡学习。点按钮后面板每 2 秒自动检查入库并刷新。</p>
+        <p style="margin:4px 0">闪卡键盘：<b>←/→</b> 切换 · <b>空格</b> 收藏 · 点击翻转释义。🔊 用浏览器本地语音朗读（无需 API key）。</p>
+        <p style="margin:4px 0">「分析/生成卡片」按钮把指令草稿填进新对话（不自动发送）；独立浏览器预览时改为复制提示词。</p>
       </div>`
 
     const save = async (patch) => {

@@ -262,6 +262,11 @@ const req = async (method, path, body) => {
   const appjsFile = readFileSync(new URL('../lab/app.js', import.meta.url), 'utf8')
   const clientFile = readFileSync(new URL('../client.js', import.meta.url), 'utf8')
   check('lab 消息类型与 client 对齐', appjsFile.includes('seekword:refresh') && clientFile.includes('seekword:refresh') && appjsFile.includes('seekword:start-ok') && clientFile.includes('seekword:start-ok'), '')
+  check('面板主入口齐备（4渠道+执行按钮+2s轮询）',
+    appjsFile.includes("['file', '📁 选择文件']") && appjsFile.includes('粘贴文本') && appjsFile.includes('YouTube') && appjsFile.includes('网页')
+    && appjsFile.includes('① 分析生词') && appjsFile.includes('② 生成卡片') && appjsFile.includes('id="cap-go"')
+    && appjsFile.includes('setInterval(pollOnce, 2000)') && appjsFile.includes('startWaiting'),
+    '')
 }
 
 srv.close()
